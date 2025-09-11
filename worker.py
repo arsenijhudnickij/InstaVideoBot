@@ -1,55 +1,68 @@
-import asyncio
 import logging
 import time
-import os
-import tempfile
-from aiogram.types import FSInputFile, URLInputFile
-from downloader import get_video_url
+from aiogram.types import URLInputFile
+from instagram_api import get_instagram_video
 from queue_manager import task_queue, active_tasks
-import yt_dlp
+from utils import check_subscription
+from database import get_language
 
 logger = logging.getLogger(__name__)
 
-async def worker(bot, worker_id: int):
+
+async def worker(bot, worker_id: int, required_channels: list[str]):
+    """
+    Асинхронный воркер, который обрабатывает очередь видео.
+    Принимает (message, url).
+    В finally удаляет queued-сообщение (если оно было) из active_tasks.
+    """
     while True:
         message, url = await task_queue.get()
         start_time = time.perf_counter()
+        user_id = message.from_user.id
 
         try:
-            video_url, ext = get_video_url(url)
-            if not video_url:
-                await message.reply("❌ Не удалось получить видео. Возможно ссылка неверна.")
+            lang = await get_language(user_id)
+
+            # Проверка подписки
+            is_subscribed = await check_subscription(bot, user_id, required_channels)
+            if not is_subscribed:
+                from main import show_subscription_requirements
+                await show_subscription_requirements(message)
                 continue
 
-            caption = "Вот ваше видео 🎬"
+            # Получаем mp4 URL через RapidAPI
+            video_url = await get_instagram_video(url)
+            if not video_url:
+                msg = (
+                    "❌ Не удалось получить видео. Попробуйте другую ссылку."
+                    if lang == "ru"
+                    else "❌ Could not retrieve the video. Try another link."
+                )
+                await message.reply(msg)
+                continue
 
-            # Сначала пробуем отдать по URL (быстро, без скачивания)
-            try:
-                await message.reply_video(URLInputFile(video_url), caption=caption)
-                logger.info(f"[Worker {worker_id}] ✅ Видео отправлено по URL: {url}")
-            except Exception as e:
-                logger.warning(f"[Worker {worker_id}] ⚠️ Ошибка URL {e}, качаем файл")
-
-                with tempfile.TemporaryDirectory(prefix="igdl_") as tmpdir:
-                    ydl_opts = {
-                        "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
-                        "format": "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio/best",
-                        "noplaylist": True,
-                        "quiet": True,
-                        "no_warnings": True,
-                    }
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info = ydl.extract_info(url, download=True)
-                        filepath = ydl.prepare_filename(info)
-
-                    await message.reply_video(FSInputFile(filepath), caption=caption)
-                    logger.info(f"[Worker {worker_id}] ✅ Видео скачано и отправлено: {url}")
+            caption = "Вот ваше видео 🎬" if lang == "ru" else "Here is your video 🎬"
+            await message.reply_video(URLInputFile(video_url), caption=caption)
+            logger.info(f"[Worker {worker_id}] ✅ Видео отправлено по URL: {url}")
 
         except Exception as e:
             logger.error(f"[Worker {worker_id}] ❌ Ошибка обработки {url}: {e}")
-            await message.reply("❌ Ошибка при загрузке видео.")
+            msg = (
+                "❌ Ошибка при загрузке видео." if lang == "ru" else "❌ Error while downloading video."
+            )
+            try:
+                await message.reply(msg)
+            except Exception:
+                logger.exception("Не удалось отправить сообщение об ошибке пользователю.")
+
         finally:
             elapsed = time.perf_counter() - start_time
-            logger.info(f"[Worker {worker_id}] ⏱ {url} за {elapsed:.2f} сек")
+            logger.info(f"[Worker {worker_id}] ⏱ {url} обработано за {elapsed:.2f} сек")
             task_queue.task_done()
-            active_tasks.pop(message.from_user.id, None)
+
+            queued_msg = active_tasks.pop(user_id, None)
+            if queued_msg:
+                try:
+                    await bot.delete_message(queued_msg.chat.id, queued_msg.message_id)
+                except Exception as e:
+                    logger.debug(f"[Worker {worker_id}] Не удалось удалить queued_msg: {e}")

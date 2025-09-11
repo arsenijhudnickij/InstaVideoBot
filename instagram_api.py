@@ -32,18 +32,23 @@ async def get_instagram_video(url: str) -> str | None:
                     return None
 
                 try:
-                    # ⚡️ игнорируем неправильный content-type (text/html вместо application/json)
                     data = await resp.json(content_type=None)
                 except Exception:
                     text = await resp.text()
                     logger.error(f"Не удалось распарсить JSON. Ответ: {text[:200]}")
                     return None
 
-                video_url = data.get("video") or data.get("url")
+                # ✅ Парсим medias
+                video_url = None
+                medias = data.get("data", {}).get("medias", [])
+                for media in medias:
+                    if media.get("type") == "video":
+                        video_url = media.get("url")
+                        break
+
                 if not video_url:
                     logger.warning(f"API не вернул video_url для {url} → {data}")
                 return video_url
-
     except Exception as e:
         logger.error(f"Ошибка при запросе к Instagram API: {e}")
         return None
